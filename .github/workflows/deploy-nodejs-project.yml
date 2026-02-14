@@ -199,7 +199,7 @@ jobs:
       # ==========================================
       # Step 4: Detect Entry Point & Start Script
       # ==========================================
-      - name: 🔍 Configure Application
+      - name: 🔍 Configure Application  
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -210,90 +210,64 @@ jobs:
             set -e
             cd ${{ env.APP_DIR }}
             
-            echo "🔍 Auto-detecting application configuration..."
-            
-            # Create logs directory
+            echo "🔍 Configuring application..."
             mkdir -p logs
             
-            # Method 1: Use npm start if available
-            if grep -q '"start"' package.json 2>/dev/null; then
-              echo "✅ Using npm start"
-              USE_NPM_START=true
-            else
-              USE_NPM_START=false
-              
-              # Method 2: Find entry point
-              echo "🔍 Detecting entry point file..."
-              ENTRY=""
-              
-              # Check package.json main field
-              ENTRY=$(node -pe "try{require('./package.json').main}catch(e){''}" 2>/dev/null || echo "")
-              
-              # If not found, search common locations
-              if [ -z "$ENTRY" ] || [ ! -f "$ENTRY" ]; then
-                for f in index.js server.js app.js main.js src/index.js src/server.js src/app.js src/main.js dist/index.js build/index.js; do
-                  if [ -f "$f" ]; then
-                    ENTRY="$f"
-                    break
-                  fi
-                done
-              fi
-              
-              # Verify file exists
-              if [ -z "$ENTRY" ]; then
-                echo "❌ ERROR: Could not find entry point!"
-                echo "Available files:"
-                find . -maxdepth 3 -name "*.js" -type f | head -20
-                exit 1
-              fi
-              
-              if [ ! -f "$ENTRY" ]; then
-                echo "❌ ERROR: Entry file does not exist: $ENTRY"
-                exit 1
-              fi
-              
-              echo "✅ Found entry point: $ENTRY"
-            fi
+            # Use Node.js to create the config
+            node <<'NODESCRIPT'
+            const fs = require('fs');
+            const path = require('path');
             
-            # Create ecosystem.config.js
-            if [ "$USE_NPM_START" = true ]; then
-              cat > ecosystem.config.js << 'ENDPM2'
-              module.exports = {
-                apps: [{
-                  name: 'nodejs-app',
-                  script: 'npm',
-                  args: 'start',
-                  instances: 1,
-                  autorestart: true,
-                  watch: false,
-                  max_memory_restart: '500M',
-                  env: { NODE_ENV: 'production', PORT: 3000 },
-                  error_file: './logs/err.log',
-                  out_file: './logs/out.log',
-                  log_date_format: 'YYYY-MM-DD HH:mm:ss'
-                }]
-              };
-              ENDPM2
-            else
-              cat > ecosystem.config.js <<ENDPM2
-              module.exports = {
-                apps: [{
-                  name: 'nodejs-app',
-                  script: '${ENTRY}',
-                  instances: 1,
-                  autorestart: true,
-                  watch: false,
-                  max_memory_restart: '500M',
-                  env: { NODE_ENV: 'production', PORT: 3000 },
-                  error_file: './logs/err.log',
-                  out_file: './logs/out.log',
-                  log_date_format: 'YYYY-MM-DD HH:mm:ss'
-                }]
-              };
-              ENDPM2
-            fi
+            let config = {
+              apps: [{
+                name: 'nodejs-app',
+                instances: 1,
+                autorestart: true,
+                watch: false,
+                max_memory_restart: '500M',
+                env: { NODE_ENV: 'production', PORT: 3000 },
+                error_file: './logs/err.log',
+                out_file: './logs/out.log',
+                log_date_format: 'YYYY-MM-DD HH:mm:ss'
+              }]
+            };
             
-            echo "✅ Created ecosystem.config.js"
+            // Detect entry point
+            try {
+              const pkg = require('./package.json');
+              
+              if (pkg.scripts && pkg.scripts.start) {
+                console.log('✅ Using npm start');
+                config.apps[0].script = 'npm';
+                config.apps[0].args = 'start';
+              } else if (pkg.main) {
+                console.log('✅ Using main:', pkg.main);
+                config.apps[0].script = pkg.main;
+              } else {
+                throw new Error('No start script or main field');
+              }
+            } catch (e) {
+              // Find entry point manually
+              const entries = ['index.js', 'server.js', 'app.js', 'src/index.js', 'src/server.js'];
+              const entry = entries.find(f => fs.existsSync(f));
+              
+              if (!entry) {
+                console.error('❌ ERROR: No entry point found!');
+                process.exit(1);
+              }
+              
+              console.log('✅ Found entry:', entry);
+              config.apps[0].script = entry;
+            }
+            
+            // Write config
+            fs.writeFileSync('ecosystem.config.js', 
+              'module.exports = ' + JSON.stringify(config, null, 2) + ';\n'
+            );
+            
+            console.log('✅ Configuration created');
+            NODESCRIPT
+            
             cat ecosystem.config.js
 
       # ==========================================
