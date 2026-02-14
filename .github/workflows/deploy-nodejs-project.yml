@@ -494,31 +494,3 @@ jobs:
           echo ""
           echo "✅ Access your website from anywhere on the internet!"
           echo "========================================="
-```
-
----
-
-## **🔧 Setup Instructions**
-
-### **Step 1: Add GitHub Secrets**
-
-Go to your repository: **Settings → Secrets and variables → Actions → New repository secret**
-
-Add these secrets:
-
-| Secret Name | Value | Example |
-|------------|-------|---------|
-| `NODE_PROJECT_URL_TO_DEPLOY` | Public GitHub URL of Node.js project | `https://github.com/username/nodejs-project.git` |
-| `SSH_PRIVATE_KEY` | Your VM's private SSH key | `-----BEGIN OPENSSH PRIVATE KEY-----...` |
-| `SSH_HOST` | Your VM's public IP address | `203.0.113.10` |
-| `SSH_USER` | SSH username | `ubuntu` or `root` |
-
----
-
-### **Step 2: Create the Workflow File**
-
-In your repository, create:
-```
-.github/
-  └── workflows/
-      └── deploy-nodejs.yml
