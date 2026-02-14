@@ -208,67 +208,93 @@ jobs:
           port: 22
           script: |
             set -e
-            
             cd ${{ env.APP_DIR }}
             
-            echo "🔍 Detecting application entry point..."
-            
-            # Detect start script or main file
-            START_SCRIPT=""
-            MAIN_FILE=""
-            
-            if [ -f "package.json" ]; then
-              # Check for start script
-              if grep -q '"start"' package.json; then
-                START_SCRIPT="npm start"
-                echo "✅ Found 'npm start' script"
-              fi
-              
-              # Check for main file
-              MAIN_FILE=$(node -p "try { require('./package.json').main } catch(e) { '' }")
-              if [ -z "$MAIN_FILE" ]; then
-                # Common entry points
-                for file in index.js server.js app.js src/index.js src/server.js src/app.js; do
-                  if [ -f "$file" ]; then
-                    MAIN_FILE="$file"
-                    echo "✅ Found main file: $MAIN_FILE"
-                    break
-                  fi
-                done
-              else
-                echo "✅ Main file from package.json: $MAIN_FILE"
-              fi
-            fi
-            
-            # Create PM2 ecosystem file
-            echo "📝 Creating PM2 ecosystem configuration..."
-            cat > ecosystem.config.js << 'EOF'
-            module.exports = {
-              apps: [{
-                name: '${{ env.APP_NAME }}',
-                script: '${MAIN_FILE:-index.js}',
-                instances: 1,
-                exec_mode: 'fork',
-                autorestart: true,
-                watch: false,
-                max_memory_restart: '500M',
-                env: {
-                  NODE_ENV: 'production',
-                  PORT: ${{ env.APP_PORT }}
-                },
-                error_file: './logs/err.log',
-                out_file: './logs/out.log',
-                log_date_format: 'YYYY-MM-DD HH:mm:ss',
-                merge_logs: true,
-                kill_timeout: 5000
-              }]
-            };
-            EOF
+            echo "🔍 Auto-detecting application configuration..."
             
             # Create logs directory
             mkdir -p logs
             
-            echo "✅ Application configured!"
+            # Method 1: Use npm start if available
+            if grep -q '"start"' package.json 2>/dev/null; then
+              echo "✅ Using npm start"
+              USE_NPM_START=true
+            else
+              USE_NPM_START=false
+              
+              # Method 2: Find entry point
+              echo "🔍 Detecting entry point file..."
+              ENTRY=""
+              
+              # Check package.json main field
+              ENTRY=$(node -pe "try{require('./package.json').main}catch(e){''}" 2>/dev/null || echo "")
+              
+              # If not found, search common locations
+              if [ -z "$ENTRY" ] || [ ! -f "$ENTRY" ]; then
+                for f in index.js server.js app.js main.js src/index.js src/server.js src/app.js src/main.js dist/index.js build/index.js; do
+                  if [ -f "$f" ]; then
+                    ENTRY="$f"
+                    break
+                  fi
+                done
+              fi
+              
+              # Verify file exists
+              if [ -z "$ENTRY" ]; then
+                echo "❌ ERROR: Could not find entry point!"
+                echo "Available files:"
+                find . -maxdepth 3 -name "*.js" -type f | head -20
+                exit 1
+              fi
+              
+              if [ ! -f "$ENTRY" ]; then
+                echo "❌ ERROR: Entry file does not exist: $ENTRY"
+                exit 1
+              fi
+              
+              echo "✅ Found entry point: $ENTRY"
+            fi
+            
+            # Create ecosystem.config.js
+            if [ "$USE_NPM_START" = true ]; then
+              cat > ecosystem.config.js << 'ENDPM2'
+              module.exports = {
+                apps: [{
+                  name: 'nodejs-app',
+                  script: 'npm',
+                  args: 'start',
+                  instances: 1,
+                  autorestart: true,
+                  watch: false,
+                  max_memory_restart: '500M',
+                  env: { NODE_ENV: 'production', PORT: 3000 },
+                  error_file: './logs/err.log',
+                  out_file: './logs/out.log',
+                  log_date_format: 'YYYY-MM-DD HH:mm:ss'
+                }]
+              };
+              ENDPM2
+            else
+              cat > ecosystem.config.js <<ENDPM2
+              module.exports = {
+                apps: [{
+                  name: 'nodejs-app',
+                  script: '${ENTRY}',
+                  instances: 1,
+                  autorestart: true,
+                  watch: false,
+                  max_memory_restart: '500M',
+                  env: { NODE_ENV: 'production', PORT: 3000 },
+                  error_file: './logs/err.log',
+                  out_file: './logs/out.log',
+                  log_date_format: 'YYYY-MM-DD HH:mm:ss'
+                }]
+              };
+              ENDPM2
+            fi
+            
+            echo "✅ Created ecosystem.config.js"
+            cat ecosystem.config.js
 
       # ==========================================
       # Step 5: Configure Nginx Reverse Proxy
@@ -366,23 +392,50 @@ jobs:
             
             echo "🚀 Starting application with PM2..."
             
-            # Stop existing app if running
-            pm2 delete ${{ env.APP_NAME }} 2>/dev/null || true
+            # Stop and delete existing app if running
+            pm2 delete ${{ env.APP_NAME }} 2>/dev/null || echo "No existing app to delete"
+            
+            # Verify ecosystem.config.js exists
+            if [ ! -f "ecosystem.config.js" ]; then
+              echo "❌ ERROR: ecosystem.config.js not found!"
+              exit 1
+            fi
+            
+            echo "📄 Using configuration:"
+            cat ecosystem.config.js
             
             # Start application
-            if [ -f "ecosystem.config.js" ]; then
-              pm2 start ecosystem.config.js
+            echo ""
+            echo "▶️  Starting PM2..."
+            pm2 start ecosystem.config.js
+            
+            # Wait a moment for app to start
+            sleep 3
+            
+            # Check if app started successfully
+            if pm2 list | grep -q "online"; then
+              echo "✅ Application started successfully!"
             else
-              pm2 start npm --name "${{ env.APP_NAME }}" -- start
+              echo "❌ Application failed to start!"
+              echo "📋 PM2 Status:"
+              pm2 status
+              echo ""
+              echo "📝 PM2 Logs:"
+              pm2 logs ${{ env.APP_NAME }} --lines 50 --nostream
+              exit 1
             fi
             
             # Save PM2 process list
             pm2 save
             
-            echo "✅ Application started!"
-            
-            # Show PM2 status
+            # Show status
+            echo ""
+            echo "📊 Current Status:"
             pm2 status
+            
+            echo ""
+            echo "📝 Recent Logs:"
+            pm2 logs ${{ env.APP_NAME }} --lines 20 --nostream
 
       # ==========================================
       # Step 7: Health Check
