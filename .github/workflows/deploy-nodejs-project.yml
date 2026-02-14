@@ -1,0 +1,524 @@
+name: 🚀 Deploy Node.js Project to VM
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      project_url:
+        description: 'GitHub URL of Node.js project to deploy'
+        required: false
+        default: ''
+
+env:
+  # GitHub URL of the Node.js project to deploy
+  NODE_PROJECT_URL_TO_DEPLOY: ${{ secrets.NODE_PROJECT_URL_TO_DEPLOY || github.event.inputs.project_url }}
+  
+  # App configuration
+  APP_NAME: nodejs-app
+  APP_DIR: /home/${{ secrets.SSH_USER }}/apps/nodejs-app
+  APP_PORT: 3000
+  NODE_VERSION: 20
+
+jobs:
+  deploy:
+    name: Setup & Deploy Node.js Application
+    runs-on: ubuntu-latest
+    
+    steps:
+      # ==========================================
+      # Step 1: Validate Environment Variables
+      # ==========================================
+      - name: ✅ Validate Configuration
+        run: |
+          echo "Validating required environment variables..."
+          
+          if [ -z "${{ env.NODE_PROJECT_URL_TO_DEPLOY }}" ]; then
+            echo "❌ ERROR: NODE_PROJECT_URL_TO_DEPLOY is not set!"
+            echo "Please set it in GitHub Secrets or provide via workflow_dispatch"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.SSH_HOST }}" ]; then
+            echo "❌ ERROR: SSH_HOST secret is not set!"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.SSH_USER }}" ]; then
+            echo "❌ ERROR: SSH_USER secret is not set!"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
+            echo "❌ ERROR: SSH_PRIVATE_KEY secret is not set!"
+            exit 1
+          fi
+          
+          echo "✅ All required variables are set!"
+          echo "📦 Project to deploy: ${{ env.NODE_PROJECT_URL_TO_DEPLOY }}"
+          echo "🖥️  Target host: ${{ secrets.SSH_HOST }}"
+
+      # ==========================================
+      # Step 2: Initial VM Setup (One-time)
+      # ==========================================
+      - name: 🛠️ Setup VM Environment
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 30m
+          script: |
+            set -e
+            
+            echo "================================"
+            echo "🚀 Starting VM Setup"
+            echo "================================"
+            
+            # Update system packages
+            echo "📦 Updating system packages..."
+            sudo apt-get update
+            
+            # Install essential packages
+            echo "📦 Installing essential packages..."
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              curl \
+              wget \
+              git \
+              build-essential \
+              ufw \
+              --no-install-recommends
+            
+            # Install Node.js
+            if ! command -v node &> /dev/null; then
+              echo "📦 Installing Node.js ${{ env.NODE_VERSION }}..."
+              curl -fsSL https://deb.nodesource.com/setup_${{ env.NODE_VERSION }}.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+            else
+              echo "✅ Node.js already installed: $(node -v)"
+            fi
+            
+            # Install PM2
+            if ! command -v pm2 &> /dev/null; then
+              echo "📦 Installing PM2..."
+              sudo npm install -g pm2
+            else
+              echo "✅ PM2 already installed: $(pm2 -v)"
+            fi
+            
+            # Install Nginx
+            if ! command -v nginx &> /dev/null; then
+              echo "📦 Installing Nginx..."
+              sudo apt-get install -y nginx
+            else
+              echo "✅ Nginx already installed"
+            fi
+            
+            # Configure UFW (Firewall)
+            echo "🔥 Configuring firewall..."
+            sudo ufw --force enable
+            sudo ufw allow OpenSSH
+            sudo ufw allow 'Nginx Full'
+            sudo ufw allow 80/tcp
+            sudo ufw allow 443/tcp
+            sudo ufw status
+            
+            # Create application directory
+            echo "📁 Creating application directory..."
+            mkdir -p ${{ env.APP_DIR }}
+            
+            # Setup PM2 startup script
+            echo "🔄 Configuring PM2 startup..."
+            pm2 startup systemd -u ${{ secrets.SSH_USER }} --hp /home/${{ secrets.SSH_USER }} | grep "sudo" | sudo bash || true
+            
+            echo "✅ VM Setup Complete!"
+            echo "================================"
+
+      # ==========================================
+      # Step 3: Clone & Setup Application
+      # ==========================================
+      - name: 📥 Clone and Setup Application
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 30m
+          script: |
+            set -e
+            
+            echo "================================"
+            echo "📥 Cloning Application"
+            echo "================================"
+            
+            cd ${{ env.APP_DIR }}
+            
+            # Remove existing files if present
+            if [ -d ".git" ]; then
+              echo "🗑️  Removing existing repository..."
+              cd ..
+              rm -rf ${{ env.APP_DIR }}
+              mkdir -p ${{ env.APP_DIR }}
+              cd ${{ env.APP_DIR }}
+            fi
+            
+            # Clone the repository
+            echo "📥 Cloning from: ${{ env.NODE_PROJECT_URL_TO_DEPLOY }}"
+            git clone ${{ env.NODE_PROJECT_URL_TO_DEPLOY }} .
+            
+            # Detect package manager and install dependencies
+            echo "📦 Installing dependencies..."
+            if [ -f "package-lock.json" ]; then
+              echo "Using npm..."
+              npm ci --production
+            elif [ -f "yarn.lock" ]; then
+              echo "Using yarn..."
+              npm install -g yarn
+              yarn install --production
+            elif [ -f "pnpm-lock.yaml" ]; then
+              echo "Using pnpm..."
+              npm install -g pnpm
+              pnpm install --prod
+            else
+              echo "Using npm install..."
+              npm install --production
+            fi
+            
+            # Run build if build script exists
+            if grep -q '"build"' package.json 2>/dev/null; then
+              echo "🔨 Running build..."
+              npm run build || echo "⚠️  Build script failed or not needed"
+            fi
+            
+            echo "✅ Application setup complete!"
+            echo "================================"
+
+      # ==========================================
+      # Step 4: Detect Entry Point & Start Script
+      # ==========================================
+      - name: 🔍 Configure Application
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            set -e
+            
+            cd ${{ env.APP_DIR }}
+            
+            echo "🔍 Detecting application entry point..."
+            
+            # Detect start script or main file
+            START_SCRIPT=""
+            MAIN_FILE=""
+            
+            if [ -f "package.json" ]; then
+              # Check for start script
+              if grep -q '"start"' package.json; then
+                START_SCRIPT="npm start"
+                echo "✅ Found 'npm start' script"
+              fi
+              
+              # Check for main file
+              MAIN_FILE=$(node -p "try { require('./package.json').main } catch(e) { '' }")
+              if [ -z "$MAIN_FILE" ]; then
+                # Common entry points
+                for file in index.js server.js app.js src/index.js src/server.js src/app.js; do
+                  if [ -f "$file" ]; then
+                    MAIN_FILE="$file"
+                    echo "✅ Found main file: $MAIN_FILE"
+                    break
+                  fi
+                done
+              else
+                echo "✅ Main file from package.json: $MAIN_FILE"
+              fi
+            fi
+            
+            # Create PM2 ecosystem file
+            echo "📝 Creating PM2 ecosystem configuration..."
+            cat > ecosystem.config.js << 'EOF'
+            module.exports = {
+              apps: [{
+                name: '${{ env.APP_NAME }}',
+                script: '${MAIN_FILE:-index.js}',
+                instances: 1,
+                exec_mode: 'fork',
+                autorestart: true,
+                watch: false,
+                max_memory_restart: '500M',
+                env: {
+                  NODE_ENV: 'production',
+                  PORT: ${{ env.APP_PORT }}
+                },
+                error_file: './logs/err.log',
+                out_file: './logs/out.log',
+                log_date_format: 'YYYY-MM-DD HH:mm:ss',
+                merge_logs: true,
+                kill_timeout: 5000
+              }]
+            };
+            EOF
+            
+            # Create logs directory
+            mkdir -p logs
+            
+            echo "✅ Application configured!"
+
+      # ==========================================
+      # Step 5: Configure Nginx Reverse Proxy
+      # ==========================================
+      - name: 🌐 Configure Nginx
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            set -e
+            
+            echo "🌐 Configuring Nginx..."
+            
+            # Create Nginx configuration
+            sudo tee /etc/nginx/sites-available/${{ env.APP_NAME }} > /dev/null << 'EOF'
+            server {
+                listen 80 default_server;
+                listen [::]:80 default_server;
+                
+                server_name _;
+                
+                # Security headers
+                add_header X-Frame-Options "SAMEORIGIN" always;
+                add_header X-Content-Type-Options "nosniff" always;
+                add_header X-XSS-Protection "1; mode=block" always;
+                
+                # Logging
+                access_log /var/log/nginx/${{ env.APP_NAME }}_access.log;
+                error_log /var/log/nginx/${{ env.APP_NAME }}_error.log;
+                
+                location / {
+                    proxy_pass http://localhost:${{ env.APP_PORT }};
+                    proxy_http_version 1.1;
+                    
+                    # WebSocket support
+                    proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Connection 'upgrade';
+                    
+                    # Proxy headers
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    
+                    # Timeouts
+                    proxy_connect_timeout 60s;
+                    proxy_send_timeout 60s;
+                    proxy_read_timeout 60s;
+                    
+                    # Buffer settings
+                    proxy_buffering on;
+                    proxy_buffer_size 4k;
+                    proxy_buffers 8 4k;
+                    
+                    proxy_cache_bypass $http_upgrade;
+                }
+                
+                # Increase max body size for file uploads
+                client_max_body_size 50M;
+            }
+            EOF
+            
+            # Enable site and remove default
+            sudo ln -sf /etc/nginx/sites-available/${{ env.APP_NAME }} /etc/nginx/sites-enabled/
+            sudo rm -f /etc/nginx/sites-enabled/default
+            
+            # Test Nginx configuration
+            echo "🧪 Testing Nginx configuration..."
+            sudo nginx -t
+            
+            # Restart Nginx
+            echo "🔄 Restarting Nginx..."
+            sudo systemctl restart nginx
+            sudo systemctl enable nginx
+            
+            echo "✅ Nginx configured and running!"
+
+      # ==========================================
+      # Step 6: Start Application with PM2
+      # ==========================================
+      - name: 🚀 Start Application
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            set -e
+            
+            cd ${{ env.APP_DIR }}
+            
+            echo "🚀 Starting application with PM2..."
+            
+            # Stop existing app if running
+            pm2 delete ${{ env.APP_NAME }} 2>/dev/null || true
+            
+            # Start application
+            if [ -f "ecosystem.config.js" ]; then
+              pm2 start ecosystem.config.js
+            else
+              pm2 start npm --name "${{ env.APP_NAME }}" -- start
+            fi
+            
+            # Save PM2 process list
+            pm2 save
+            
+            echo "✅ Application started!"
+            
+            # Show PM2 status
+            pm2 status
+
+      # ==========================================
+      # Step 7: Health Check
+      # ==========================================
+      - name: 🏥 Health Check
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            echo "🏥 Running health check..."
+            echo "⏳ Waiting for application to start..."
+            sleep 10
+            
+            # Try to access the application
+            MAX_ATTEMPTS=15
+            ATTEMPT=1
+            
+            while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+              echo "Attempt $ATTEMPT/$MAX_ATTEMPTS..."
+              
+              # Try localhost first
+              if curl -f -s http://localhost:${{ env.APP_PORT }} > /dev/null 2>&1; then
+                echo "✅ Application is responding on port ${{ env.APP_PORT }}!"
+                break
+              fi
+              
+              if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+                echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
+                echo "📝 Checking PM2 logs:"
+                pm2 logs ${{ env.APP_NAME }} --lines 20 --nostream
+                exit 1
+              fi
+              
+              ATTEMPT=$((ATTEMPT + 1))
+              sleep 3
+            done
+            
+            # Test through Nginx
+            echo ""
+            echo "🌐 Testing Nginx proxy..."
+            if curl -f -s http://localhost > /dev/null 2>&1; then
+              echo "✅ Nginx proxy is working!"
+            else
+              echo "⚠️  Nginx proxy may have issues"
+            fi
+
+      # ==========================================
+      # Step 8: Deployment Summary & Live URL
+      # ==========================================
+      - name: 📊 Deployment Summary
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            echo ""
+            echo "========================================"
+            echo "✅ DEPLOYMENT SUCCESSFUL!"
+            echo "========================================"
+            echo ""
+            echo "📦 Application: ${{ env.APP_NAME }}"
+            echo "🔗 Repository: ${{ env.NODE_PROJECT_URL_TO_DEPLOY }}"
+            echo "📍 Deployed to: ${{ env.APP_DIR }}"
+            echo ""
+            echo "🌐 LIVE URL (accessible from internet):"
+            echo "========================================"
+            echo "   http://${{ secrets.SSH_HOST }}"
+            echo "========================================"
+            echo ""
+            echo "📊 Application Status:"
+            pm2 status
+            echo ""
+            echo "📝 Recent Logs:"
+            pm2 logs ${{ env.APP_NAME }} --lines 15 --nostream
+            echo ""
+            echo "🔧 Useful Commands:"
+            echo "  - View logs: pm2 logs ${{ env.APP_NAME }}"
+            echo "  - Restart app: pm2 restart ${{ env.APP_NAME }}"
+            echo "  - Stop app: pm2 stop ${{ env.APP_NAME }}"
+            echo "  - App status: pm2 status"
+            echo ""
+            echo "========================================"
+
+      # ==========================================
+      # Step 9: Display Live URL (GitHub Actions Output)
+      # ==========================================
+      - name: 🎉 Display Live URL
+        run: |
+          echo ""
+          echo "========================================="
+          echo "🎉 DEPLOYMENT COMPLETE!"
+          echo "========================================="
+          echo ""
+          echo "🌍 Your application is now live at:"
+          echo ""
+          echo "   🔗 http://${{ secrets.SSH_HOST }}"
+          echo ""
+          echo "========================================="
+          echo ""
+          echo "📝 Additional Information:"
+          echo "  - Application: ${{ env.APP_NAME }}"
+          echo "  - Port: ${{ env.APP_PORT }}"
+          echo "  - Repository: ${{ env.NODE_PROJECT_URL_TO_DEPLOY }}"
+          echo ""
+          echo "✅ Access your website from anywhere on the internet!"
+          echo "========================================="
+```
+
+---
+
+## **🔧 Setup Instructions**
+
+### **Step 1: Add GitHub Secrets**
+
+Go to your repository: **Settings → Secrets and variables → Actions → New repository secret**
+
+Add these secrets:
+
+| Secret Name | Value | Example |
+|------------|-------|---------|
+| `NODE_PROJECT_URL_TO_DEPLOY` | Public GitHub URL of Node.js project | `https://github.com/username/nodejs-project.git` |
+| `SSH_PRIVATE_KEY` | Your VM's private SSH key | `-----BEGIN OPENSSH PRIVATE KEY-----...` |
+| `SSH_HOST` | Your VM's public IP address | `203.0.113.10` |
+| `SSH_USER` | SSH username | `ubuntu` or `root` |
+
+---
+
+### **Step 2: Create the Workflow File**
+
+In your repository, create:
+```
+.github/
+  └── workflows/
+      └── deploy-nodejs.yml
