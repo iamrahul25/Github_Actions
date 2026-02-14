@@ -1,0 +1,766 @@
+name: 🚀 Deploy Node.js with HTTPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      project_url:
+        description: 'GitHub URL of Node.js project to deploy'
+        required: false
+        default: ''
+
+env:
+  # GitHub URL of the Node.js project to deploy
+  NODE_PROJECT_URL_TO_DEPLOY: ${{ secrets.NODE_PROJECT_URL_TO_DEPLOY || github.event.inputs.project_url }}
+  
+  # App configuration
+  APP_NAME: nodejs-app
+  APP_DIR: /home/${{ secrets.SSH_USER }}/apps/nodejs-app
+  APP_PORT: 3000
+  NODE_VERSION: 20
+  
+  # SSL/Domain configuration (NEW)
+  DOMAIN: ${{ secrets.DOMAIN }}
+  SSL_EMAIL: ${{ secrets.SSL_EMAIL }}
+
+jobs:
+  deploy:
+    name: Setup & Deploy with HTTPS
+    runs-on: ubuntu-latest
+    
+    steps:
+      # ==========================================
+      # Step 1: Validate Environment Variables
+      # ==========================================
+      - name: ✅ Validate Configuration
+        run: |
+          echo "Validating required environment variables..."
+          
+          if [ -z "${{ env.NODE_PROJECT_URL_TO_DEPLOY }}" ]; then
+            echo "❌ ERROR: NODE_PROJECT_URL_TO_DEPLOY is not set!"
+            echo "Please set it in GitHub Secrets or provide via workflow_dispatch"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.SSH_HOST }}" ]; then
+            echo "❌ ERROR: SSH_HOST secret is not set!"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.SSH_USER }}" ]; then
+            echo "❌ ERROR: SSH_USER secret is not set!"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
+            echo "❌ ERROR: SSH_PRIVATE_KEY secret is not set!"
+            exit 1
+          fi
+          
+          echo "✅ All required variables are set!"
+          echo "📦 Project to deploy: ${{ env.NODE_PROJECT_URL_TO_DEPLOY }}"
+          echo "🖥️  Target host: ${{ secrets.SSH_HOST }}"
+          
+          # Check if HTTPS will be enabled
+          if [ -n "${{ env.DOMAIN }}" ]; then
+            echo "🔐 Domain configured: ${{ env.DOMAIN }}"
+            echo "🔒 HTTPS will be enabled with Let's Encrypt"
+          else
+            echo "⚠️  No domain configured - HTTP only"
+            echo "💡 Add DOMAIN and SSL_EMAIL secrets for HTTPS"
+          fi
+
+      # ==========================================
+      # Step 2: Initial VM Setup (One-time)
+      # ==========================================
+      - name: 🛠️ Setup VM Environment
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 30m
+          script: |
+            set -e
+            
+            echo "================================"
+            echo "🚀 Starting VM Setup"
+            echo "================================"
+            
+            # Update system packages
+            echo "📦 Updating system packages..."
+            sudo apt-get update
+            
+            # Install essential packages
+            echo "📦 Installing essential packages..."
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              curl \
+              wget \
+              git \
+              build-essential \
+              ufw \
+              --no-install-recommends
+            
+            # Install Node.js
+            if ! command -v node &> /dev/null; then
+              echo "📦 Installing Node.js ${{ env.NODE_VERSION }}..."
+              curl -fsSL https://deb.nodesource.com/setup_${{ env.NODE_VERSION }}.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+            else
+              echo "✅ Node.js already installed: $(node -v)"
+            fi
+            
+            # Install PM2
+            if ! command -v pm2 &> /dev/null; then
+              echo "📦 Installing PM2..."
+              sudo npm install -g pm2
+            else
+              echo "✅ PM2 already installed: $(pm2 -v)"
+            fi
+            
+            # Install Nginx
+            if ! command -v nginx &> /dev/null; then
+              echo "📦 Installing Nginx..."
+              sudo apt-get install -y nginx
+            else
+              echo "✅ Nginx already installed"
+            fi
+            
+            # Install Certbot for SSL (if domain is configured)
+            if [ -n "${{ env.DOMAIN }}" ]; then
+              if ! command -v certbot &> /dev/null; then
+                echo "📦 Installing Certbot for SSL..."
+                sudo apt-get install -y certbot python3-certbot-nginx
+              else
+                echo "✅ Certbot already installed"
+              fi
+            fi
+            
+            # Configure UFW (Firewall)
+            echo "🔥 Configuring firewall..."
+            sudo ufw --force reset
+            sudo ufw default deny incoming
+            sudo ufw default allow outgoing
+            sudo ufw allow 22/tcp
+            sudo ufw allow 80/tcp
+            sudo ufw allow 443/tcp
+            sudo ufw allow OpenSSH
+            sudo ufw allow 'Nginx Full'
+            sudo ufw --force enable
+            sudo ufw status
+            
+            # Create application directory
+            echo "📁 Creating application directory..."
+            mkdir -p ${{ env.APP_DIR }}
+            
+            # Setup PM2 startup script
+            echo "🔄 Configuring PM2 startup..."
+            pm2 startup systemd -u ${{ secrets.SSH_USER }} --hp /home/${{ secrets.SSH_USER }} | grep "sudo" | sudo bash || true
+            
+            echo "✅ VM Setup Complete!"
+            echo "================================"
+
+      # ==========================================
+      # Step 3: Clone & Setup Application
+      # ==========================================
+      - name: 📥 Clone and Setup Application
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 30m
+          script: |
+            set -e
+            
+            echo "================================"
+            echo "📥 Cloning Application"
+            echo "================================"
+            
+            cd ${{ env.APP_DIR }}
+            
+            # Remove existing files if present
+            if [ -d ".git" ]; then
+              echo "🗑️  Removing existing repository..."
+              cd ..
+              rm -rf ${{ env.APP_DIR }}
+              mkdir -p ${{ env.APP_DIR }}
+              cd ${{ env.APP_DIR }}
+            fi
+            
+            # Clone the repository
+            echo "📥 Cloning from: ${{ env.NODE_PROJECT_URL_TO_DEPLOY }}"
+            git clone ${{ env.NODE_PROJECT_URL_TO_DEPLOY }} .
+            
+            # Detect package manager and install dependencies
+            echo "📦 Installing dependencies..."
+            if [ -f "package-lock.json" ]; then
+              echo "Using npm..."
+              npm ci --production
+            elif [ -f "yarn.lock" ]; then
+              echo "Using yarn..."
+              npm install -g yarn
+              yarn install --production
+            elif [ -f "pnpm-lock.yaml" ]; then
+              echo "Using pnpm..."
+              npm install -g pnpm
+              pnpm install --prod
+            else
+              echo "Using npm install..."
+              npm install --production
+            fi
+            
+            # Run build if build script exists
+            if grep -q '"build"' package.json 2>/dev/null; then
+              echo "🔨 Running build..."
+              npm run build || echo "⚠️  Build script failed or not needed"
+            fi
+            
+            echo "✅ Application setup complete!"
+            echo "================================"
+
+      # ==========================================
+      # Step 4: Detect Entry Point & Start Script
+      # ==========================================
+      - name: 🔍 Configure Application  
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            set -e
+            cd ${{ env.APP_DIR }}
+            
+            echo "🔍 Configuring application..."
+            mkdir -p logs
+            
+            # Use Node.js to create the config
+            node <<'NODESCRIPT'
+            const fs = require('fs');
+            const path = require('path');
+            
+            let config = {
+              apps: [{
+                name: 'nodejs-app',
+                instances: 1,
+                autorestart: true,
+                watch: false,
+                max_memory_restart: '500M',
+                env: { NODE_ENV: 'production', PORT: 3000 },
+                error_file: './logs/err.log',
+                out_file: './logs/out.log',
+                log_date_format: 'YYYY-MM-DD HH:mm:ss'
+              }]
+            };
+            
+            // Detect entry point
+            try {
+              const pkg = require('./package.json');
+              
+              if (pkg.scripts && pkg.scripts.start) {
+                console.log('✅ Using npm start');
+                config.apps[0].script = 'npm';
+                config.apps[0].args = 'start';
+              } else if (pkg.main) {
+                console.log('✅ Using main:', pkg.main);
+                config.apps[0].script = pkg.main;
+              } else {
+                throw new Error('No start script or main field');
+              }
+            } catch (e) {
+              // Find entry point manually
+              const entries = ['index.js', 'server.js', 'app.js', 'src/index.js', 'src/server.js'];
+              const entry = entries.find(f => fs.existsSync(f));
+              
+              if (!entry) {
+                console.error('❌ ERROR: No entry point found!');
+                process.exit(1);
+              }
+              
+              console.log('✅ Found entry:', entry);
+              config.apps[0].script = entry;
+            }
+            
+            // Write config
+            fs.writeFileSync('ecosystem.config.js', 
+              'module.exports = ' + JSON.stringify(config, null, 2) + ';\n'
+            );
+            
+            console.log('✅ Configuration created');
+            NODESCRIPT
+            
+            cat ecosystem.config.js
+
+      # ==========================================
+      # Step 5: Configure Nginx (HTTP/HTTPS Ready)
+      # ==========================================
+      - name: 🌐 Configure Nginx
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            set -e
+            
+            echo "🌐 Configuring Nginx..."
+            
+            DOMAIN="${{ env.DOMAIN }}"
+            
+            if [ -n "$DOMAIN" ]; then
+              # Configuration for domain (HTTPS-ready)
+              echo "🔐 Configuring Nginx for domain: $DOMAIN"
+              
+              sudo tee /etc/nginx/sites-available/${{ env.APP_NAME }} > /dev/null <<EOF
+            server {
+                listen 80;
+                listen [::]:80;
+                server_name $DOMAIN www.$DOMAIN;
+                
+                # Security headers
+                add_header X-Frame-Options "SAMEORIGIN" always;
+                add_header X-Content-Type-Options "nosniff" always;
+                add_header X-XSS-Protection "1; mode=block" always;
+                
+                # Logging
+                access_log /var/log/nginx/${{ env.APP_NAME }}_access.log;
+                error_log /var/log/nginx/${{ env.APP_NAME }}_error.log;
+                
+                location / {
+                    proxy_pass http://localhost:${{ env.APP_PORT }};
+                    proxy_http_version 1.1;
+                    
+                    # WebSocket support
+                    proxy_set_header Upgrade \$http_upgrade;
+                    proxy_set_header Connection 'upgrade';
+                    
+                    # Proxy headers
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto \$scheme;
+                    
+                    # Timeouts
+                    proxy_connect_timeout 60s;
+                    proxy_send_timeout 60s;
+                    proxy_read_timeout 60s;
+                    
+                    # Buffer settings
+                    proxy_buffering on;
+                    proxy_buffer_size 4k;
+                    proxy_buffers 8 4k;
+                    
+                    proxy_cache_bypass \$http_upgrade;
+                }
+                
+                # Increase max body size for file uploads
+                client_max_body_size 50M;
+            }
+            EOF
+            
+            else
+              # Configuration for IP only (HTTP)
+              echo "📍 Configuring Nginx for IP address (HTTP only)"
+              
+              sudo tee /etc/nginx/sites-available/${{ env.APP_NAME }} > /dev/null <<'EOF'
+            server {
+                listen 80 default_server;
+                listen [::]:80 default_server;
+                
+                server_name _;
+                
+                # Security headers
+                add_header X-Frame-Options "SAMEORIGIN" always;
+                add_header X-Content-Type-Options "nosniff" always;
+                add_header X-XSS-Protection "1; mode=block" always;
+                
+                # Logging
+                access_log /var/log/nginx/${{ env.APP_NAME }}_access.log;
+                error_log /var/log/nginx/${{ env.APP_NAME }}_error.log;
+                
+                location / {
+                    proxy_pass http://localhost:${{ env.APP_PORT }};
+                    proxy_http_version 1.1;
+                    
+                    # WebSocket support
+                    proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Connection 'upgrade';
+                    
+                    # Proxy headers
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    
+                    # Timeouts
+                    proxy_connect_timeout 60s;
+                    proxy_send_timeout 60s;
+                    proxy_read_timeout 60s;
+                    
+                    # Buffer settings
+                    proxy_buffering on;
+                    proxy_buffer_size 4k;
+                    proxy_buffers 8 4k;
+                    
+                    proxy_cache_bypass $http_upgrade;
+                }
+                
+                # Increase max body size for file uploads
+                client_max_body_size 50M;
+            }
+            EOF
+            
+            fi
+            
+            # Enable site and remove default
+            sudo ln -sf /etc/nginx/sites-available/${{ env.APP_NAME }} /etc/nginx/sites-enabled/
+            sudo rm -f /etc/nginx/sites-enabled/default
+            
+            # Test Nginx configuration
+            echo "🧪 Testing Nginx configuration..."
+            sudo nginx -t
+            
+            # Restart Nginx
+            echo "🔄 Restarting Nginx..."
+            sudo systemctl restart nginx
+            sudo systemctl enable nginx
+            
+            echo "✅ Nginx configured and running!"
+
+      # ==========================================
+      # Step 6: Setup SSL Certificate with Let's Encrypt (NEW)
+      # ==========================================
+      - name: 🔒 Setup HTTPS with Let's Encrypt
+        if: env.DOMAIN != ''
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            set -e
+            
+            DOMAIN="${{ env.DOMAIN }}"
+            EMAIL="${{ env.SSL_EMAIL }}"
+            
+            # Use default email if not provided
+            if [ -z "$EMAIL" ]; then
+              EMAIL="admin@$DOMAIN"
+            fi
+            
+            echo "================================"
+            echo "🔒 Setting up SSL Certificate"
+            echo "================================"
+            echo "Domain: $DOMAIN"
+            echo "Email: $EMAIL"
+            echo ""
+            
+            # Obtain SSL certificate
+            echo "📜 Requesting SSL certificate from Let's Encrypt..."
+            
+            sudo certbot --nginx \
+              -d "$DOMAIN" \
+              -d "www.$DOMAIN" \
+              --non-interactive \
+              --agree-tos \
+              --email "$EMAIL" \
+              --redirect \
+              --hsts \
+              --staple-ocsp || {
+                echo "⚠️  Failed to get certificate for www.$DOMAIN"
+                echo "🔄 Trying without www subdomain..."
+                
+                sudo certbot --nginx \
+                  -d "$DOMAIN" \
+                  --non-interactive \
+                  --agree-tos \
+                  --email "$EMAIL" \
+                  --redirect \
+                  --hsts \
+                  --staple-ocsp
+              }
+            
+            if [ $? -eq 0 ]; then
+              echo ""
+              echo "✅ SSL Certificate obtained successfully!"
+              echo ""
+              
+              # Setup auto-renewal
+              echo "🔄 Setting up automatic renewal..."
+              sudo systemctl enable certbot.timer
+              sudo systemctl start certbot.timer
+              
+              # Test renewal
+              echo "🧪 Testing certificate renewal..."
+              sudo certbot renew --dry-run
+              
+              echo ""
+              echo "✅ SSL setup complete!"
+              echo "🔐 Certificate will auto-renew every 90 days"
+              
+              # Display certificate info
+              echo ""
+              echo "📋 Certificate Information:"
+              sudo certbot certificates
+              
+            else
+              echo ""
+              echo "❌ Failed to obtain SSL certificate"
+              echo "⚠️  Your site will run on HTTP only"
+              echo ""
+              echo "Possible issues:"
+              echo "  1. DNS not pointing to this server"
+              echo "  2. Firewall blocking port 80/443"
+              echo "  3. Domain name not propagated yet"
+              echo ""
+              echo "💡 Check your DuckDNS configuration:"
+              echo "   - Domain: $DOMAIN"
+              echo "   - Points to: $(curl -s ifconfig.me)"
+            fi
+
+      # ==========================================
+      # Step 7: Start Application with PM2
+      # ==========================================
+      - name: 🚀 Start Application
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            set -e
+            
+            cd ${{ env.APP_DIR }}
+            
+            echo "🚀 Starting application with PM2..."
+            
+            # Stop and delete existing app if running
+            pm2 delete ${{ env.APP_NAME }} 2>/dev/null || echo "No existing app to delete"
+            
+            # Verify ecosystem.config.js exists
+            if [ ! -f "ecosystem.config.js" ]; then
+              echo "❌ ERROR: ecosystem.config.js not found!"
+              exit 1
+            fi
+            
+            echo "📄 Using configuration:"
+            cat ecosystem.config.js
+            
+            # Start application
+            echo ""
+            echo "▶️  Starting PM2..."
+            pm2 start ecosystem.config.js
+            
+            # Wait a moment for app to start
+            sleep 3
+            
+            # Check if app started successfully
+            if pm2 list | grep -q "online"; then
+              echo "✅ Application started successfully!"
+            else
+              echo "❌ Application failed to start!"
+              echo "📋 PM2 Status:"
+              pm2 status
+              echo ""
+              echo "📝 PM2 Logs:"
+              pm2 logs ${{ env.APP_NAME }} --lines 50 --nostream
+              exit 1
+            fi
+            
+            # Save PM2 process list
+            pm2 save
+            
+            # Show status
+            echo ""
+            echo "📊 Current Status:"
+            pm2 status
+            
+            echo ""
+            echo "📝 Recent Logs:"
+            pm2 logs ${{ env.APP_NAME }} --lines 20 --nostream
+
+      # ==========================================
+      # Step 8: Health Check
+      # ==========================================
+      - name: 🏥 Health Check
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            echo "🏥 Running health check..."
+            echo "⏳ Waiting for application to start..."
+            sleep 10
+            
+            # Try to access the application
+            MAX_ATTEMPTS=15
+            ATTEMPT=1
+            
+            while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+              echo "Attempt $ATTEMPT/$MAX_ATTEMPTS..."
+              
+              # Try localhost first
+              if curl -f -s http://localhost:${{ env.APP_PORT }} > /dev/null 2>&1; then
+                echo "✅ Application is responding on port ${{ env.APP_PORT }}!"
+                break
+              fi
+              
+              if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+                echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
+                echo "📝 Checking PM2 logs:"
+                pm2 logs ${{ env.APP_NAME }} --lines 20 --nostream
+                exit 1
+              fi
+              
+              ATTEMPT=$((ATTEMPT + 1))
+              sleep 3
+            done
+            
+            # Test through Nginx
+            echo ""
+            echo "🌐 Testing Nginx proxy..."
+            if curl -f -s http://localhost > /dev/null 2>&1; then
+              echo "✅ Nginx proxy is working!"
+            else
+              echo "⚠️  Nginx proxy may have issues"
+            fi
+
+      # ==========================================
+      # Step 9: Deployment Summary & Live URL
+      # ==========================================
+      - name: 📊 Deployment Summary
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            DOMAIN="${{ env.DOMAIN }}"
+            
+            echo ""
+            echo "========================================"
+            echo "✅ DEPLOYMENT SUCCESSFUL!"
+            echo "========================================"
+            echo ""
+            echo "📦 Application: ${{ env.APP_NAME }}"
+            echo "🔗 Repository: ${{ env.NODE_PROJECT_URL_TO_DEPLOY }}"
+            echo "📍 Deployed to: ${{ env.APP_DIR }}"
+            echo ""
+            
+            if [ -n "$DOMAIN" ]; then
+              # Check if SSL certificate exists
+              if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+                echo "🌐 LIVE URL (HTTPS - Secure):"
+                echo "========================================"
+                echo "   🔒 https://$DOMAIN"
+                echo "========================================"
+                echo ""
+                echo "✅ SSL Certificate: Active"
+                echo "🔄 Auto-renewal: Enabled"
+                echo "📧 Notifications: ${{ env.SSL_EMAIL }}"
+                echo ""
+                echo "📝 Note: HTTP automatically redirects to HTTPS"
+              else
+                echo "🌐 LIVE URL (HTTP):"
+                echo "========================================"
+                echo "   http://$DOMAIN"
+                echo "========================================"
+                echo ""
+                echo "⚠️  SSL setup failed - using HTTP only"
+                echo "💡 Check DNS and try redeploying"
+              fi
+            else
+              echo "🌐 LIVE URL (HTTP - No Domain):"
+              echo "========================================"
+              echo "   http://${{ secrets.SSH_HOST }}"
+              echo "========================================"
+              echo ""
+              echo "💡 To enable HTTPS:"
+              echo "   1. Get a domain (free: duckdns.org)"
+              echo "   2. Add DOMAIN secret in GitHub"
+              echo "   3. Add SSL_EMAIL secret in GitHub"
+              echo "   4. Redeploy"
+            fi
+            
+            echo ""
+            echo "📊 Application Status:"
+            pm2 status
+            echo ""
+            echo "📝 Recent Logs:"
+            pm2 logs ${{ env.APP_NAME }} --lines 15 --nostream
+            echo ""
+            echo "🔧 Useful Commands:"
+            echo "  - View logs: pm2 logs ${{ env.APP_NAME }}"
+            echo "  - Restart app: pm2 restart ${{ env.APP_NAME }}"
+            echo "  - Stop app: pm2 stop ${{ env.APP_NAME }}"
+            echo "  - App status: pm2 status"
+            if [ -n "$DOMAIN" ]; then
+              echo "  - Renew SSL: sudo certbot renew"
+              echo "  - SSL status: sudo certbot certificates"
+            fi
+            echo ""
+            echo "========================================"
+
+      # ==========================================
+      # Step 10: Display Live URL (GitHub Actions Output)
+      # ==========================================
+      - name: 🎉 Display Live URL
+        run: |
+          DOMAIN="${{ env.DOMAIN }}"
+          
+          echo ""
+          echo "========================================="
+          echo "🎉 DEPLOYMENT COMPLETE!"
+          echo "========================================="
+          echo ""
+          
+          if [ -n "$DOMAIN" ]; then
+            echo "🌍 Your application is now live at:"
+            echo ""
+            echo "   🔒 https://$DOMAIN"
+            echo ""
+            echo "========================================="
+            echo ""
+            echo "🔐 Security Features:"
+            echo "  ✅ HTTPS enabled with Let's Encrypt"
+            echo "  ✅ SSL certificate auto-renews"
+            echo "  ✅ HTTP redirects to HTTPS"
+            echo "  ✅ Security headers enabled"
+            echo ""
+          else
+            echo "🌍 Your application is now live at:"
+            echo ""
+            echo "   🔗 http://${{ secrets.SSH_HOST }}"
+            echo ""
+            echo "========================================="
+            echo ""
+            echo "⚠️  Running on HTTP (not secure)"
+            echo ""
+            echo "💡 To enable HTTPS (FREE):"
+            echo "  1. Get free domain: https://duckdns.org"
+            echo "  2. Add GitHub Secrets:"
+            echo "     - DOMAIN: yourapp.duckdns.org"
+            echo "     - SSL_EMAIL: your@email.com"
+            echo "  3. Push code to redeploy"
+            echo ""
+          fi
+          
+          echo "📝 Additional Information:"
+          echo "  - Application: ${{ env.APP_NAME }}"
+          echo "  - Port: ${{ env.APP_PORT }}"
+          echo "  - Repository: ${{ env.NODE_PROJECT_URL_TO_DEPLOY }}"
+          echo ""
+          echo "✅ Access your website from anywhere on the internet!"
+          echo "========================================="
